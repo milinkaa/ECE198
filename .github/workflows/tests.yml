@@ -1,5 +1,5 @@
 # Runs the Flask test suite on every push and pull request to render-demo.
-# Render (with autoDeployTrigger: checksPass) only deploys if this passes.
+# Validate Python and Arduino firmware before merging into the deployment branch.
 name: Tests
 
 on:
@@ -28,3 +28,22 @@ jobs:
 
       - name: Run tests
         run: python -m pytest
+
+      - name: Check browser JavaScript syntax
+        run: node --check static/arduino-sync.js
+
+  arduino-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install UNO R4 Minima core and OLED libraries
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:renesas_uno
+          arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306"
+
+      - name: Compile V3 prescription-sync firmware
+        run: arduino-cli compile --fqbn arduino:renesas_uno:minima firmware/v3/CCCARE_Arduino
