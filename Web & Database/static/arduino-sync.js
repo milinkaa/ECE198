@@ -1,4 +1,4 @@
-// Browser USB Serial bridge for CCCARE V3 prescription sync and exercise upload.
+// Browser USB Serial bridge for CCCARE V3/V4 prescription sync and exercise upload.
 // Device targets are fetched from the authenticated patient's active plan.
 (() => {
   "use strict";
@@ -20,12 +20,36 @@
   let connected = false;
   let buffer = "";
   let pendingPrescription = null;
+  const firmwareExercises = ["Arm Curl", "Front Arm Raise", "Lateral Arm Raise"];
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
   function status(message, isError = false) {
     statusNode.textContent = message;
     statusNode.style.color = isError ? "#d64e61" : "";
+  }
+
+  function clearPrescription() {
+    window.clearTimeout(pendingPrescription?.timeout);
+    pendingPrescription = null;
+    planSelect.disabled = false;
+  }
+
+  async function writePrescription(expected, payload) {
+    const writer = port.writable.getWriter();
+    try {
+      await writer.write(encoder.encode(payload));
+    } finally {
+      writer.releaseLock();
+    }
+    if (pendingPrescription !== expected) return;
+    expected.timeout = window.setTimeout(() => {
+      if (pendingPrescription !== expected) return;
+      clearPrescription();
+      status("No confirmation from Arduino. Reconnect and check the firmware before starting.", true);
+      connected = false;
+      void reader?.cancel().catch(() => {});
+    }, 4000);
   }
 
   function parseExerciseRecord(line) {
@@ -48,50 +72,50 @@
   // Fetch fresh targets from Flask rather than trusting an editable browser input.
   async function sendSelectedPrescription() {
     if (!connected || !port?.writable) throw new Error("Arduino is not connected.");
+    if (pendingPrescription || planSelect.disabled) return;
 
     const option = planSelect.selectedOptions[0];
     if (!option?.dataset.prescriptionUrl) {
       throw new Error("Select a patient exercise plan before connecting.");
     }
-    const response = await fetch(option.dataset.prescriptionUrl, {
-      method: "GET",
-      credentials: "same-origin",
-      cache: "no-store"
-    });
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(result.error || "Could not retrieve this patient's prescription.");
-    }
-
-    const { exercise_name, sets, reps, duration_seconds, frequency_per_week } = result;
-    const values = [sets, reps, duration_seconds, frequency_per_week];
-    if (!["Arm Curl", "Front Arm Raise", "Lateral Arm Raise"].includes(exercise_name) ||
-        !values.every(Number.isInteger) ||
-        sets < 1 || sets > 99 || reps < 1 || reps > 1000 ||
-        duration_seconds < 0 || duration_seconds > 36000 ||
-        frequency_per_week < 1 || frequency_per_week > 7) {
-      throw new Error("This exercise prescription is not supported by the connected firmware.");
-    }
-
-    const payload = `PLAN,${exercise_name},${sets},${reps},${duration_seconds},${frequency_per_week}\n`;
-    const expected = { name: exercise_name, planId: result.plan_id };
-    pendingPrescription = expected;
-    status("Sending " + exercise_name + " (" + sets + " sets × " + reps +
-      " reps) to the Arduino. Waiting for device confirmation...");
-
-    const writer = port.writable.getWriter();
+    const currentPort = port;
+    planSelect.disabled = true;
     try {
-      await writer.write(encoder.encode(payload));
-    } finally {
-      writer.releaseLock();
-    }
-
-    // An old V2/V3 sketch can still upload records, but cannot accept PLAN data.
-    window.setTimeout(() => {
-      if (connected && pendingPrescription === expected) {
-        status("No PLAN_OK confirmation from Arduino. Upload the updated dose-sync V3 firmware; the old sketch still uses preset targets.", true);
+      const response = await fetch(option.dataset.prescriptionUrl, {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store"
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(result.error || "Could not retrieve this patient's prescription.");
       }
-    }, 4000);
+
+      const { exercise_name, sets, reps, duration_seconds, frequency_per_week } = result;
+      const values = [sets, reps, duration_seconds, frequency_per_week];
+      const index = firmwareExercises.indexOf(exercise_name);
+      if (index < 0 ||
+          !values.every(Number.isInteger) ||
+          sets < 1 || sets > 99 || reps < 1 || reps > 1000 ||
+          duration_seconds < 0 || duration_seconds > 36000 ||
+          frequency_per_week < 1 || frequency_per_week > 7) {
+        throw new Error("This exercise prescription is not supported by the connected firmware.");
+      }
+      if (!connected || port !== currentPort) return;
+
+      const payload = `PLAN,${exercise_name},${sets},${reps},${duration_seconds},${frequency_per_week}\n`;
+      const expected = { name: exercise_name, index, reps, seconds: duration_seconds, protocol: "PLAN" };
+      pendingPrescription = expected;
+      status("Sending " + exercise_name + " (" + sets + " sets × " + reps +
+        " reps) to the Arduino. Waiting for device confirmation...");
+
+      expected.write = writePrescription(expected, payload);
+      await expected.write;
+    } catch (error) {
+      if (port !== currentPort) return;
+      clearPrescription();
+      throw error;
+    }
   }
 
   async function upload(record) {
@@ -129,17 +153,48 @@
   }
 
   async function handleSerialLine(line) {
+    const expected = pendingPrescription;
+    if (line === "ERROR,FORMAT" && expected?.protocol === "PLAN") {
+      // V4 explicitly rejects PLAN and accepts SET. V3 keeps its existing path.
+      await expected.write;
+      if (!connected || pendingPrescription !== expected) return;
+      window.clearTimeout(expected.timeout);
+      if (expected.seconds < 1 || expected.seconds > 3600) {
+        clearPrescription();
+        status("Arduino v4 requires a duration from 1 to 60 minutes. Ask your instructor to update this plan.", true);
+        return;
+      }
+      expected.protocol = "SET";
+      expected.write = writePrescription(expected, `SET,${expected.index},${expected.reps},${expected.seconds}\n`);
+      await expected.write;
+      return;
+    }
+    if (line.startsWith("ACK,")) {
+      if (expected?.protocol === "SET" && line === `ACK,${expected.index}`) {
+        clearPrescription();
+        status(`Arduino v4 confirmed ${expected.name}: ${expected.reps} reps, ${expected.seconds} seconds. ` +
+          "Select the same exercise on the device. Sets and weekly frequency remain on the website.");
+      }
+      return;
+    }
+    if (line.startsWith("ERROR,") && expected?.protocol === "SET") {
+      clearPrescription();
+      status(line === "ERROR,BUSY"
+        ? "Arduino has an active workout. Finish it or reset with B4, then reconnect to send the plan."
+        : "Arduino v4 rejected the prescription: " + line.slice("ERROR,".length), true);
+      return;
+    }
     if (line.startsWith("PLAN_OK,")) {
       const exerciseName = line.slice("PLAN_OK,".length).trim();
-      if (pendingPrescription?.name === exerciseName) {
-        pendingPrescription = null;
+      if (expected?.protocol === "PLAN" && expected.name === exerciseName) {
+        clearPrescription();
         status("Prescription synced to Arduino OLED: " + exerciseName +
           ". Start the workout and press Confirm to save the result.");
       }
       return;
     }
-    if (line.startsWith("PLAN_ERROR,")) {
-      pendingPrescription = null;
+    if (line.startsWith("PLAN_ERROR,") && expected?.protocol === "PLAN") {
+      clearPrescription();
       status("Arduino rejected the prescription: " + line.slice("PLAN_ERROR,".length), true);
       return;
     }
@@ -154,7 +209,7 @@
         try {
           while (connected) {
             const { value, done } = await reader.read();
-            if (done) break;
+            if (done) { connected = false; break; }
             buffer += decoder.decode(value, { stream: true });
             let end;
             while ((end = buffer.indexOf("\n")) >= 0) {
@@ -173,13 +228,15 @@
       status(error.message || "Unable to read from Arduino.", true);
     } finally {
       connected = false;
-      pendingPrescription = null;
-      connectButton.disabled = false;
+      const write = pendingPrescription?.write;
+      clearPrescription();
       disconnectButton.disabled = true;
+      await write?.catch(() => {});
       if (port) {
         try { await port.close(); } catch (_) { /* already disconnected */ }
         port = null;
       }
+      connectButton.disabled = false;
     }
   }
 
@@ -193,6 +250,7 @@
       return;
     }
     try {
+      connectButton.disabled = true;
       // requestPort must be called from a direct user gesture.
       port = await navigator.serial.requestPort();
       await port.open({ baudRate: 115200 });
@@ -229,10 +287,10 @@
 
   disconnectButton.addEventListener("click", async () => {
     connected = false;
-    pendingPrescription = null;
     if (reader) {
       try { await reader.cancel(); } catch (_) { /* already disconnected */ }
     }
     status("Disconnecting Arduino...");
   });
 })();
+
