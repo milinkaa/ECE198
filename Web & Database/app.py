@@ -1,4 +1,5 @@
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from functools import wraps
 from pathlib import Path
 import os
@@ -111,6 +112,20 @@ def create_app():
                       SESSION_COOKIE_HTTPONLY=True,
                       SESSION_COOKIE_SAMESITE='Lax')
     db.init_app(app); csrf.init_app(app)
+
+    @app.template_filter('waterloo_datetime')
+    def waterloo_datetime(value):
+        """Display UTC-naive historical timestamps in Waterloo local time.
+
+        DateTime records were stored with datetime.utcnow(), so these existing
+        naive values represent UTC, not the server or browser local time.
+        """
+        if value is None:
+            return ''
+        utc_value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+        return utc_value.astimezone(ZoneInfo('America/Toronto')).strftime(
+            '%b %d, %Y · %I:%M %p %Z'
+        )
 
     @app.errorhandler(CSRFError)
     def handle_expired_form(error):
@@ -469,6 +484,30 @@ def create_app():
                 db.session.add(ProgressLog(patient=me(),plan=plan,sets_completed=sets,reps_completed=reps,duration_minutes=dur,notes=request.form.get('notes','').strip() or None)); db.session.commit(); flash('Progress saved.','success'); return redirect(url_for('dashboard'))
             except ValueError: flash('Enter valid completed sets, reps, and duration.','error')
         return render_template('progress_form.html',plan=plan)
+
+    # Read live prescription targets only for the signed-in patient's active plan.
+    # The browser sends these values to the Arduino using the USB Serial connection.
+    @app.route('/api/device/prescription/<int:plan_id>', methods=['GET'])
+    @role_required('patient')
+    def device_prescription(plan_id):
+        plan = db.session.get(ExercisePlan, plan_id)
+        if not plan or not plan.active or plan.patient_id != me().id:
+            return jsonify(error='This prescription is not available for the signed-in patient.'), 404
+
+        supported = ('Arm Curl', 'Front Arm Raise', 'Lateral Arm Raise')
+        exercise_name = plan.exercise.name
+        if exercise_name not in supported:
+            return jsonify(error='This Arduino firmware supports Arm Curl, Front Arm Raise, and Lateral Arm Raise.'), 400
+
+        duration_seconds = plan.duration_minutes * 60 if plan.duration_minutes is not None else 0
+        if not (1 <= plan.sets <= 99 and 1 <= plan.reps <= 1000
+                and 0 <= duration_seconds <= 36000 and 1 <= plan.frequency_per_week <= 7):
+            return jsonify(error='Prescription exceeds the Arduino display limits.'), 400
+
+        return jsonify(plan_id=plan.id, exercise_name=exercise_name,
+                       sets=plan.sets, reps=plan.reps,
+                       duration_seconds=duration_seconds,
+                       frequency_per_week=plan.frequency_per_week)
 
     # Save a USB Serial exercise record against the signed-in patient's active prescription.
     # This endpoint is called by the patient's browser after explicit Web Serial permission.
