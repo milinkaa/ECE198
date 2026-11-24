@@ -29,6 +29,9 @@ jobs:
       - name: Run tests
         run: python -m pytest
 
+      - name: Check browser JavaScript syntax
+        run: node --check static/arduino-sync.js
+
   arduino-compile:
     runs-on: ubuntu-latest
     steps:
