@@ -18,6 +18,7 @@
   let port = null;
   let reader = null;
   let connected = false;
+  let disconnectRequested = false;
   let buffer = "";
   let pendingPrescription = null;
   const firmwareExercises = ["Arm Curl", "Front Arm Raise", "Lateral Arm Raise"];
@@ -228,15 +229,28 @@
       status(error.message || "Unable to read from Arduino.", true);
     } finally {
       connected = false;
+      const manualDisconnect = disconnectRequested;
       const write = pendingPrescription?.write;
       clearPrescription();
       disconnectButton.disabled = true;
       await write?.catch(() => {});
+      let closeError = null;
       if (port) {
-        try { await port.close(); } catch (_) { /* already disconnected */ }
-        port = null;
+        try {
+          await port.close();
+        } catch (error) {
+          closeError = error;
+        } finally {
+          port = null;
+        }
       }
       connectButton.disabled = false;
+      disconnectRequested = false;
+      if (manualDisconnect) {
+        status(closeError
+          ? "The serial port did not close cleanly. Unplug the Arduino, then refresh before reconnecting."
+          : "Arduino disconnected. You can reconnect when ready.", Boolean(closeError));
+      }
     }
   }
 
@@ -286,11 +300,30 @@
   });
 
   disconnectButton.addEventListener("click", async () => {
+    if (disconnectRequested || !port) return;
+    disconnectRequested = true;
     connected = false;
-    if (reader) {
-      try { await reader.cancel(); } catch (_) { /* already disconnected */ }
-    }
+    disconnectButton.disabled = true;
+    connectButton.disabled = true;
     status("Disconnecting Arduino...");
+    const oldPort = port;
+
+    // A pending SerialPort.read() must be cancelled and its reader lock
+    // released before SerialPort.close() can complete in readFromDevice().
+    try {
+      if (reader) {
+        await reader.cancel();
+      }
+      // If the reader has already completed, the read loop's finally block
+      // will own the port closure. Never race two close() calls.
+    } catch (error) {
+      status("Unable to cancel the serial read. Unplug the Arduino and refresh the page.", true);
+    }
+    window.setTimeout(() => {
+      if (disconnectRequested && port === oldPort) {
+        status("USB port is taking too long to close. Unplug Arduino and refresh this page before reconnecting.", true);
+      }
+    }, 5000);
   });
 })();
 
